@@ -1,5 +1,5 @@
 # uber_fastest_route
-This repo includes my solution to the "best route for a uber driver in Boston" based on Uber data from kaggle -- [Retrieved data from Kaggle Dataset Uber & Lyft Cab prices](https://www.kaggle.com/ravi72munde/uber-lyft-cab-prices)
+This repo includes my solution in R to the "best route for a Uber driver in Boston" problem based on Uber data from kaggle -- [Retrieved data from Kaggle Dataset Uber & Lyft Cab prices](https://www.kaggle.com/ravi72munde/uber-lyft-cab-prices)
 
 This is a 7-day team project from my course Introduction to R BAN 6010 at Wake Forest University. Full credits granted (1/20 teams).
 

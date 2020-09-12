@@ -7,15 +7,15 @@ I contributed to these following cahpters:
 - Chap 1
 - Chap 2
 - Chap 3 (part)
--- Chap 3.1
--- Chap 3.2
--- Chap 3.4
--- Chap 3.5
+  - Chap 3.1
+  - Chap 3.2
+  - Chap 3.4
+  - Chap 3.5
 - Chap 4
 - Chap 5 (Part)
--- Chap 5.1
--- Chap 5.3
--- Chap 5.4
--- Chap 5.5
+  - Chap 5.1
+  - Chap 5.3
+  - Chap 5.4
+  - Chap 5.5
 - Chap 6
 - Chap 7

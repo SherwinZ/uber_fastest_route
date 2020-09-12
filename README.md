@@ -19,3 +19,13 @@ I contributed to these following cahpters:
   - Chap 5.5
 - Chap 6
 - Chap 7
+
+
+## Reference
+
+[1] Retrieved data from Kaggle Dataset Uber & Lyft Cab prices, URL:
+https://www.kaggle.com/ravi72munde/uber-lyft-cab-prices
+
+[2] ggmap: D. Kahle and H. Wickham. ggmap: Spatial Visualization with ggplot2. The R Journal, 5(1), 144-161. URL: http://journal.r-project.org/archive/2013-1/kahle-wickham.pdf
+
+[3] Retrieved shape file from Boston Open Portal: https://data.boston.gov/dataset/boston-neighborhoods

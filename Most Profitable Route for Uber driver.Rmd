@@ -1,0 +1,1035 @@
+---
+title: "Uber & Lyft price quotes"
+author: "Team Hive (13): Kahla Seymour, Erik Whitcomb, Melanie Yang, Shengwei Zheng"
+date: "8/8/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, warning = F}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F, fig.width = 9, fig.height = 6)
+```
+
+**Team Hive (13)**
+
+*Kahla Seymour, Erik Whitcomb, Melanie Yang, Shengwei Zheng*
+
+*Aug 20, 2019*
+
+**Please put the file `Boston_Neighborhoods.zip` in the working directory and unzip it before running the R markdown file.**
+
+# 1. Introduction and Key Insights
+
+Our main goal of this project are, first, to determine what factors are affecting the prices of Uber and Lyft rides to increase (surge) and to be able to better predict when these will rise, then to find the best possible route to maximize the revenue of a driver with a certain budget. 
+
+We discovered that the two biggest factors affecting the price are the company (Uber or Lyft) and which type of car (Shared, XL, etc.). Factors that don’t have an affect is time of day, what day of the week it is, and weather, specifically rainfall. We created a linear regression model and formula stated below: 
+
+- unit_price = 8.60 + 8.71(product_typeLuxury XL) - 5.98(product_typeRegular) - 7.28(product_typeShared) - 2.90(product_typeXL) + 3.29(cab_typeUber) - 0.148(day_timeMidday) - 0.180(day_timeMorning) + 3.29(day_timeNight) - 0.737(rain_levelLight) + 0.176(rain_levelMedium) + 1.01(rain_levelNo Rain) - 1.17(weekend)
+
+With regard to the best route, we successfully found one employing linear programming and operations research. In brief, given a source and destination, the best strategy for a driver is keeping taking advantage of the most lucrative route in terms of unit price per minute repeatedly until running out of budget and to exit.
+
+
+# 2. Data Import and Environment Initialization
+
+For the tidy of the code, set up the coding environment by attaching the necessary packages and setting the working directory at the very first step.
+
+```{r initialization}
+library(readr)
+library(tidyverse)
+library(tibble)
+library(lubridate)
+library(tibbletime)
+library(stringr)
+library(xts)
+library(scales)
+library(igraph)
+library(network)
+library(intergraph)
+library(httr)
+library(xml2)
+library(GGally)
+library(modelr)
+library(lpSolve)
+library('sf')
+library(ggmap)
+options(scipen = 200)
+
+setwd("C:/WFU/Courses/Intro_to_R/Group Project")
+```
+
+
+## 2.1 Data Quality
+
+```{r Data import, message = F}
+cab_rides <- read_csv("C:/WFU/Courses/Intro_to_R/Group Project/cab_rides.csv") %>%
+  rename(distance_miles = distance)
+# extract only the time stamp from the txt file because that variable is incomplete in the csv file
+cab_rides_stamp <- read.delim2("C:/WFU/Courses/Intro_to_R/Group Project/cab_rides.txt", header = T, sep = ",", skipNul = T) %>%
+  select(time_stamp)
+cab_rides <- cab_rides %>%
+  mutate(time_stamp = cab_rides_stamp$time_stamp)
+
+weather <- read_csv("C:/WFU/Courses/Intro_to_R/Group Project/weather.csv")
+glimpse(cab_rides)
+glimpse(weather)
+```
+
+The data indicates that it was collected through the last week of Nov to Dec 18'. However, the data-set does not have a consecutive date sampling. Some of the dates during Dec18' are missing. It may results in the sample error when we compute the linear regression model. 
+
+When defining the product types for each ride to better compare the price difference between the two companies, we figured out that some of the ride do not share the same product types with the regular Uber and Lyft. The comparison would be meaningless for those observations as they do not have a standard setting. Therefore, we decided to not use the ride observations for those and marked their product type as `NA`.
+
+In this sample data, most of the days have no rain. Therefore, it might have a sample bias when building the model.
+
+Some observations does not have an actual price shown. These NA observation would result in sampling error as well. The good thing, since our sample size is fairly large, the effect would be relatively small.
+
+In order to analyze data between the product types, we combined like cars. However, both of the companies had cars that were unique to the company and did not share qualities of these cars with other company cars. We only looked at certain cars that were shared between both companies.
+
+The data in the dataset are not the real ride data. Instead,they are queried at regular intervals with the Uber and Lyft in-app estimation.  So we keep skeptical about whether the real ride price would differ from the in-app estimation. For instance, in a particular time, the surge is high so people would wait until the price went down. 
+
+
+
+## 2.2 Tidying `cab_rides`
+
+Glimpsing the data-set, we found that the data-sets were pretty tidy except the time_stamp, which we need to convert to a more readable format than the Unix time stamp.
+Besides, we considered it necessary to add one more column representing the common product type across Uber and Lyft for comparisons in our analyses, so we searched the cab's website and found the matches below. For unmatched product we tagged `NA` in this column.
+
+Table of product type comparisons
+
+| Product Type | Uber      | Lyft         |
+| ------------ | --------- | ------------ |
+| Shared       | UberPool  | Shared       |
+| Regular      | UberX     | Lyft         |
+| XL           | UberXL    | Lyft XL      |
+| Luxury       | Black     | Lux          |
+| Luxury XL    | Black SUV | Lux Black XL |
+| `NA`         | WAV, Taxi | Lux Black    |
+
+```{r prepare product type column}
+# show the unique product types of the two companies
+cab_rides %>%
+  group_by(cab_type, name) %>%
+  dplyr::summarize()
+
+# a function to tag the product type so that they are comparable
+joined_type <- function(x) {
+  if (x == "Shared" | x == "UberPool") {
+    return("Shared")
+  } else if (x == "Lyft" | x == "UberX") {
+    return("Regular") 
+  } else if (x %in% c("Lyft XL", "UberXL")) {
+    return("XL")
+  } else if (x %in% c("Lux", "Black")) {
+    return("Luxury") 
+  } else if (x %in% c("Lux Black XL", "Black SUV")) {
+    return("Luxury XL")
+  } else {
+    return(NA)
+  }
+}
+
+# use the function to tag the product type
+cab_rides <- cab_rides %>%
+  mutate(product_type = unlist(map(name, ~ joined_type(.))))
+```
+
+Converting the Unix time stamp in the original data-set into a POSIXct format. Since the time stamp was in milliseconds, as said the data creator, we divided the number by 1000 before the conversion.
+
+```{r converting time_stamp}
+# the time stamp in cab_rides was in milliseconds so we divide the time stamp by 1000
+cab_rides <- cab_rides %>%
+  mutate(time = as.POSIXct(time_stamp/1000, origin = "1970-01-01 00:00:00"))
+```
+
+
+
+## 2.3 Tidying `weather`
+
+Similar manipulation on the time stamp in the `weather` data-set while the number was in seconds.
+
+```{r tidying weather}
+weather$rain[is.na(weather$rain)] <- 0
+
+# convert time stamp
+weather <- weather %>%
+  mutate(time = as.POSIXct(time_stamp, origin = "1970-01-01 00:00:00"))
+```
+
+
+## 2.4 Data Quality
+
+The data indicates that it was collected through the last week of Nov to Dec 18'. However, the dataset does not have a consecutive date sampling. Some of the dates during Dec18' are missing. It may results in the sample error when we compute the linear regression model. 
+
+When defining the product types for each ride to better compare the price difference between the two companies, we figured out that some of the ride do not share the same product types with the regular Uber and Lyft. The comparison would be meaningless for those observations as they do not have a standard setting. Therefore, we decided to not use the ride observations for those and marked their product type as NA.
+
+In this sample data, most of the days have no rain. Therefore, it might have a sample bias when building the model.
+
+Some observations does not have an actual price shown. These NA observation would result in sampling error as well. The good thing, since our sample size is fairly large, the effect would be relatively small.
+
+In order to analyze data between the product types, we combined like cars. However, both of the companies had cars that were unique to the company and did not share qualities of these cars with other company cars. We only looked at certain cars that were shared between both companies.
+
+The data in the dataset are not the real ride data. Instead,they are queried at regular intervals with the Uber and Lyft in-app estimation. So we keep skeptical about whether the real ride price would differ from the in-app estimation. For instance, in a particular time, the surge is high so people would wait until the price went down. 
+
+We will go into details with graphs in chapter 3.
+
+
+## 2.5 Metadata
+
+Our data-set has two parts, the `cab_rides` was real-time queries (not actual rides) every 5 minutes for the prices quotes of 12 destinations real-time data using Uber&Lyft API queries and the `weather` the corresponding weather conditions.
+
+**`cab_rides`, (693071 obs of 10 variables)**
+
+| Variable Name    | Data Type | Description                                                  |
+| ---------------- | --------- | ------------------------------------------------------------ |
+| distance_miles   | double    | the distance of the recorded trip in miles                   |
+| cab_type         | char      | Uber or Lyft                                                 |
+| time             | POSXIct   | The date and the time of the record                          |
+| destination      | char      | the destination of the trip                                  |
+| source           | char      | the starting point of the trip                               |
+| price            | double    | the price quote of a potential (not actual) trip             |
+| surge_multiplier | double    | The multiplier by which price was increased, default 1. Only the Lyft's has multipliers larger than one |
+| id               | char      | unique identifier                                            |
+| product_id       | char      | Uber/Lyft identifier for cab-type                            |
+| name             | char      | Visible product type essentially                             |
+| product_type     | char      | Common product type                                          |
+
+
+**`weather`, (6276 obs of 10 variable)**
+
+| Variable Name | Data Type | Description                                                  |
+| ------------- | --------- | ------------------------------------------------------------ |
+| temp          | double    | temperature                                                  |
+| source        | char      | The location of the weather data collected                   |
+| clouds        | double    | Clouds                                                       |
+| pressure      | double    | pressure in MB                                               |
+| rain          | double    | rain in inches for the last hr                               |
+| time_stamp    | double    | the Unix time stamp, seconds starting from 1970-01-01 00:00:00 GMT |
+| humidity      | double    | humidity in %                                                |
+| wind          | double    | wind speed in mph                                            |
+| time          | POSXIct   | The date and the time of the record                          |
+| rain_level    | char      | The level of rain                                            |
+
+
+# 3. Exploratory Data Analysis (EDA)
+
+## 3.1 Number of `NA`s
+
+```{r Number of NA for cab_rides}
+na_count <- cab_rides %>%
+  select(everything()) %>%
+  summarize_all(funs(sum(is.na(.))))
+
+# Transpose the na_count table
+na_count <- tibble(var = names(na_count), 
+                   count = unlist(transpose(na_count)))
+
+# plot the na_count
+ggplot(na_count, aes(reorder(`var`, + `count`), `count`, fill = `var`)) +
+  geom_bar(stat = "identity", alpha = 0.5, width = 0.618) +
+  coord_flip() + 
+  geom_text(aes(y = `count`, label = `count`), position = position_dodge(0.9), hjust = -0.5) +
+  labs(title = "# NAs for all variable of the data-set") +
+  theme(legend.position = "none") +
+  theme(axis.ticks = element_line(color = "white")) +
+  xlab("variable name") +
+  ylim(0, 175000)
+```
+
+The count of `NA`s shows that there are 161426 NAs in our customized variable `product_type` and 55095 in `price`. For `product_type`, the `NA`s were the unmatched product. For `price`, it was likely that the data-set creator failed to query some of them because the price usually takes a while to load so the API just returned Null.
+
+## 3.2 The date of the data-set is not consecutive
+
+While exploring the time variable of `cab_rides`, we were surprised to find that the date was not consecutive given the time information embedded in the data-set, so we added a dummy variable to identify the observation period. More importantly, it may lead to the sample error when we compute the linear regression model if some dates are missing.
+
+| Time                          | Period tag |
+| ----------------------------- | ---------- |
+| Nov 26, 2018 - Dec 04, 2018   | Period 1   |
+| Dec 9, 2018 and Dec 10,  2018 | Period 2   |
+| Dec 13, 2018 - Dec 18, 2018   | Period 3   |
+
+
+```{r the number of observations for each date}
+cab_rides2 <- cab_rides %>%
+  mutate(date = as.Date(time), 
+         period = NA)
+
+cab_rides2$period[cab_rides2$date < as.Date("2018-12-09")] <- "Period 1"
+cab_rides2$period[cab_rides2$date > as.Date("2018-12-08") & cab_rides2$date < as.Date("2018-12-11")] <- "Period 2"  
+cab_rides2$period[cab_rides2$date > as.Date("2018-12-10")] <- "Period 3"
+
+cab_rides2 %>%
+  group_by(date) %>%
+  dplyr::summarize(n_obs = n(), period = first(period)) %>%
+  ggplot(aes(date, n_obs, group = period)) +
+  geom_col(aes(fill = period), width = 0.618, alpha = 0.8) +
+  labs(title = "The Number of Observations for Each Date")+
+  theme(axis.ticks = element_line(color = "white"))
+```
+
+
+## 3.3 Geom_Bar of Time of Day vs Price vs Product_Type
+
+
+```{r Explore the Factor: Time of Day}
+cab_rides3 <- cab_rides2 %>%
+   separate(time, into = c("day", "time"),sep = " ") 
+
+cab_rides3 <- cab_rides3 %>%
+  separate(time, into = c("hour", "minute", "day"), sep = ":")
+
+i <- c(13)
+cab_rides3[ , i] <- apply(cab_rides3[ ,i], 2, function(x) as.numeric(as.character(x)))
+
+cab_rides3$Day_time <- cab_rides3$`hour`
+
+Day_time <- function(x) {
+   if (isTRUE(x > 05 & x <= 10)) {
+    return ("Morning")
+  } else if (isTRUE(x > 10 & x <= 15)) {
+    return ("Midday")
+  } else if (isTRUE(x > 15 & x <= 21 )) {
+    return ("Evening")
+  } else if (isTRUE(x > 21 & x <= 24)){
+    return ("Night")
+  } else {
+     return ("Night")
+  }
+}
+
+cab_rides3$Day_time <- sapply(cab_rides3$'hour', Day_time)
+
+(Time_Table <- cab_rides3 %>%
+  group_by(Day_time) %>%
+  dplyr::summarize(mean_price = mean(price, na.rm = TRUE)))
+
+Df<- select(cab_rides3, 'Day_time', 'product_type', 'price')
+(Price_time_product <- Df %>%
+  group_by(product_type, Day_time) %>%
+   dplyr::summarize(mean_price = mean(price, na.rm = TRUE)))
+
+(Time_Price_graph2 <- ggplot(data = Price_time_product) + 
+  geom_bar(mapping = aes(x = Day_time, y = mean_price, fill = product_type), stat = "identity", position = "dodge")) + 
+   labs(title = paste("Time of Day vs. Average Price"), x = "Time of Day", y = "Average Price", fill = "Product Type")
+
+Df2<- select(cab_rides3, 'Day_time', 'cab_type', 'price')
+Price_time_cab_type <- Df2 %>%
+  group_by(cab_type, Day_time) %>%
+   dplyr::summarize(mean_price = mean(price, na.rm = TRUE))
+
+(Time_Price_graph2 <- ggplot(data = Price_time_cab_type) + 
+  geom_bar(mapping = aes(x = Day_time, y = mean_price, fill = cab_type), stat = "identity", position = "dodge")) + 
+   labs(title = paste("Time of Day vs. Average Price"), x = "Time of Day", y = "Average Price", fill = "Company")
+```
+
+The two graphs above show the differences in average price during a specific time of day. The prices of day are as follows: Morning = 5 to 10 am, Midday = 10 am to 3 pm, Evening = 3pm to 9pm, and Night = 9pm to 5 am. The first graph compares these 2 variables by product_type. It looks to be that there is no significant difference between the average price and the time of day. The second graph compares the variables by company (Lyft or Uber). The graph again looks to show that there is no significant difference between time of day, however, Lyft's average price is higher the whole day.
+
+## 3.4 Prices over Date
+
+```{r prices over date}
+# average price across all product type each day
+cab_rides2 %>%
+  group_by(date) %>%
+  dplyr::summarize(mean_price = mean(price, na.rm = T), period = first(period)) %>%
+  ggplot(aes(date, mean_price, group = period, col = period)) +
+  geom_line(size = 2) +
+  scale_x_date(breaks = date_breaks("1 week"), label = date_format("%b %d %Y \n%A")) +
+  labs(title = "Average Price Across All Product Type Each Day",
+       y = "Price") +
+  theme(axis.ticks = element_line(color = "white")) +
+  ylim(15, 19)
+```
+
+The price fluctuated over time. As Uber stated, prices may increase to help ensure that those who need a ride can get one. This system is called surge pricing. Surge pricing automatically goes into effect when there are more riders in a given area than available drivers. So if we want to check the effect of number of riders on the price, it is advisable to normalize the price by dividing the price by the multiplier.
+
+```{r the avgerage price over time for each company}
+
+# the avgerage price over time for each company
+cab_rides2 %>%
+  mutate(groups = paste(cab_type, " X ", period)) %>%
+  group_by(date, cab_type) %>%
+  dplyr::summarize(mean_price = mean(price, na.rm = T), groups = first(groups)) %>%
+  ggplot(aes(date, mean_price, group = groups, col = cab_type)) +
+  geom_line(size = 2) +
+  scale_x_date(breaks = date_breaks("1 week"), label = date_format("%b %d %Y \n%A")) +
+  labs(title = "Average Price Over Date for Each Company",
+       y = "Price") +
+  theme(axis.ticks = element_line(color = "white")) +
+  ylim(15, 19)
+```
+
+In the graph above, it surprised us that the average prices of Lyft were higher than the prices of Uber consistently. People can explains this phenomenon in different ways but we prefer to say that the Uber keeps its price low by well managing its cost.
+
+Besides, the price of Lyft varies more than Uber. The rider should be careful comparing prices when she or he would like to take a ride during a period of high demand.
+
+
+```{r Lyft & Uber by product Type}
+## Lyft
+cab_rides2 %>%
+  filter(cab_type == "Lyft") %>%
+  mutate(groups = paste(name, " X ", period)) %>%
+  rename(product = name) %>%
+  group_by(product, date) %>%
+  dplyr::summarize(mean_price = mean(price, na.rm = T), groups = first(groups)) %>%
+  na.omit() %>%
+  ggplot(aes(date, mean_price, group = groups, col = product)) +
+  geom_line(size = 2) +
+  scale_x_date(breaks = date_breaks("1 week"), label = date_format("%b %d %Y \n%A")) +
+  labs(title = "Lyft: Avoiding competition with Uber",
+       y = "Price") +
+  theme(axis.ticks = element_line(color = "white")) +
+  ylim(4, 38)
+
+# by product_type
+## Uber
+cab_rides2 %>%
+  filter(cab_type == "Uber") %>%
+  mutate(groups = paste(name, " X ", period)) %>%
+  rename(product = name) %>%
+  group_by(product, date) %>%
+  dplyr::summarize(mean_price = mean(price, na.rm = T), groups = first(groups)) %>%
+  na.omit() %>%
+  ggplot(aes(date, mean_price, group = groups, col = product)) +
+  geom_line(size = 2) +
+  scale_x_date(breaks = date_breaks("1 week"), label = date_format("%b %d %Y \n%A")) +
+  labs(title = "Uber: Black's price should be raised",
+       y = "Price",
+       subtitle = "The price curve of WAV covered UberX because their prices were completely the same") +
+  theme(axis.ticks = element_line(color = "white")) +
+  ylim(4, 38)
+```
+
+Overall, the market segmentation of Lyft and Uber are mutually exclusive except for UberX and Lyft Shared in Boston.
+
+For Lyft, its prices overall were more elastic and have a larger range with the maximum and minimum more extreme than those of Uber. More specifically, the price of Lyft Shared is lower than the price of the UberPool, and the Lyft Black XL a little more expensive as well as more volatile than Uber Black SUV. Therefore, it is advisable for a shared ride taker to take Lyft Shared instead of UberPool since the former is cheaper.
+
+However, the price of plain Lyft is pretty much at the same level of that of UberX. Our interpretation is that this market niche traditionally belongs only to cabs. Riders consider it a fair price for a ride thus is a place of strategic importance of contention and neither company would surrender it submissively.
+
+
+For Uber, its graph gives a picture of how Uber segments the market based on price precisely without overlap, but there is still space for improvement if we are picky.
+
+First, **the price of Uber Black should be raised to evenly segment the market**. The trend for all Uber cab types are the same except for Uber Black, a premium ride up to 4 with a professional driver. As the demand for Black SUV and UberXL went up, the demand for Uber Black went down, as indicated by the prices. Besides, the price of Uber Black falls closer to UberXL than to Black SUV. 
+
+These two phenomena showed that the Uber Black faced intense competition and were probably competing with its akins in Boston. If we were the manager of Uber at this region, we would adjust the price range of Uber Black so that Uber seize every market niche and leave no room for competitors.
+
+Last but not the least, it is very considerate for Uber to take the social responsibility by introducing the wheelchair-accessible vehicle (WAV) and maintain the price the same as UberX, and that is why the price curve of WAV covered UberX.
+
+
+## 3.5 prices between weekday and weekend
+
+```{r prices between weekday and weekend versus cab type, warning = F}
+
+cab_rides2 %>%
+  mutate(day = fct_reorder(weekdays(time, abbreviate = T), wday(time))) %>%
+  group_by(day) %>%
+  dplyr::summarize(price = mean(price, na.rm = T)) %>%
+  ggplot(aes(day, price)) +
+    geom_col(aes(fill = (day %in% c("Sun", "Sat"))), width = 0.618, alpha = 0.7) +
+    geom_line(aes(color = "#FA8072"), size = 2, alpha = 0.8) +
+    geom_text(aes(y = price, label = round(price, 2)), position = position_dodge(0.9), vjust = -0.5) +
+    theme(legend.position = "none") +
+    theme(axis.ticks = element_line(color = "white"), axis.text.y = element_blank()) +
+    labs(title = "average price per day")
+```
+
+The prices do not vary much between weekends and weekdays, so there is no such weekend effect on price if we were to conduct time series analysis, but we still notice fluctuations in the last 3 graphs about price versus date. What effect would that be?
+
+
+```{r grouped by cab type}
+# grouped by cab type
+
+cab_rides2 %>%
+  mutate(day = fct_reorder(weekdays(time, abbreviate = T), wday(time))) %>%
+  group_by(cab_type, day) %>%
+  dplyr::summarize(price = mean(price, na.rm = T)) %>%
+  ggplot(aes(day, price, fill = cab_type, label = round(price, 2))) +
+    geom_col(width = 0.618, alpha = 0.8, position = "dodge") +
+    geom_text(vjust = -0.5, position = position_dodge(width = 0.618)) +
+    theme(axis.ticks = element_line(color = "white"), axis.text.y = element_blank()) +
+    labs(title = "Average Price per Day for Each Company")
+```
+
+Comparing the price of different cab type versus the day of a week, we found that the average price of Lyft is still higher than Uber.
+
+
+
+## 3.6 Weather factor analysis
+
+```{r weather factor analysis}
+rain <- function(x){
+  if (x==0){
+    return("No Rain")
+  }else if (x<0.1 & x>0){
+   return("Light")
+ } else if(x>=0.1 & x<0.3){
+  return("Medium")
+ } else {
+  return("Heavy")
+ }
+}
+
+weather <- weather %>%
+  mutate(rain_level = unlist(map(rain, ~ rain(.)))) %>%
+  rename(source = location)
+
+
+weather.new <- weather %>%
+  select(source, time, rain_level, temp)
+
+weather.new$time = as.POSIXct(weather.new$time)
+
+# add a hour column
+weather.new <- weather.new %>%
+  mutate(hour = hour(time),
+         date = as.Date(time))
+
+# weather.new$time<-format(weather.new$time,format='%Y-%m-%d %H')
+
+cab_rides.new<-cab_rides[c(1,2,4:12)]
+
+cab_rides.new <- cab_rides.new %>%
+  mutate(hour = hour(time),
+         date = as.Date(time))
+# cab_rides.new$time<-format(cab_rides$time,format='%Y-%m-%d %H')
+
+new <- left_join(cab_rides.new, weather.new, by = c("source", "date", "hour"))
+
+# graph 1
+new %>% 
+  na.omit() %>%
+  ggplot(aes(x = price,y = distance_miles, color = rain_level)) +
+  geom_point(position = "jitter") +
+  labs(title = "Price v.s Distance Miles by Rain Level") +
+  geom_hline(aes(yintercept = 5), color = "#800000", size = 2, linetype = 4)
+
+# graph 2
+weather %>%
+  count(rain_level) %>%
+  ggplot(aes(x = reorder(rain_level, -n), y = n)) +
+  geom_col(aes(fill = rain_level), width = 0.618, alpha = 0.6) +
+  geom_text(aes(x = reorder(rain_level, -n), y = n, label = n), 
+            position = position_dodge(0.9), vjust = -0.5) +
+  ylim(0, 5500) +
+  theme(legend.position = "none") +
+  labs(title = "The Rain Level Frequencies",
+       x = "Rain Level",
+       y = "Frequencies")
+  
+# graph 3
+ggplot(weather.new, aes(x = date, y = source, color = rain_level)) +
+  geom_point(size = 3) +
+  labs(title = "Source v.s Date by Rain Level")
+
+
+# graph 4
+ggplot(weather.new, aes(x=date, y=source, color = temp))+
+  geom_point(size = 3) +
+  labs(title = "Source v.s Date by Temperature") +
+  scale_color_gradient(low = "#FFF8DC", high = "#FF4500")
+
+```
+
+First, we convert the weather into four levels according to the official rain level setting. In this way, we could acknowledge the rain level impact in an easy way. Then, we combine the rain_level data to cab_rides data-set together to match the weather with the ride information based upon the source and the time. By combining, we could compare rain level factors with other variables we want. We plot the graph for rain_level versus price. In this sample data, most of the days have no rain. Therefore, it might have a sample bias when building the model.According to the observation, the influence is not as significant as we anticipated. To illustrate, if the distance is controlled at 5miles, the price points are spread evenly with no significant indicator shows the strong relationship between the two. The scatter points are distributed in a fairly normal way. So we observed that the rain_day would not necessarily ties with the price increase.
+
+
+| Precipitation                             | Rainfall Level |
+| ----------------------------------------- | -------------- |
+| 0                                         | No Rain        |
+| < 2.5 mm (0.098 in)                       | Light          |
+| 2.5 mm (0.098 in) - 7.6 mm (0.30 in)      | Medium         |
+| 10 mm (0.39 in) - 50 mm (2.0 in) per hour | Heavy          |
+
+
+# 3. Linear Regression modeling
+
+```{r Linear Regression}
+
+reg_mod <- cab_rides %>% 
+  mutate(day_time = cab_rides3$Day_time,
+         weekend = (wday(time) == 0 | wday(time) == 6),
+         date = as.Date(time),
+         hour = hour(time),
+         unit_price = price / (surge_multiplier * distance_miles)) %>%
+  left_join(weather.new, by = c("source", "date", "hour")) %>%
+  select(unit_price, cab_type, product_type, day_time, rain_level, weekend) %>%
+  na.omit()
+
+
+mod1 <- lm(unit_price ~ product_type + cab_type + day_time + rain_level + weekend, data = reg_mod)
+broom::tidy(mod1)
+summary(mod1)
+sim1 <- reg_mod %>%
+  gather_residuals(mod1)
+ggplot(sim1, aes(unit_price, resid, color)) +
+  geom_point()
+
+```
+
+Linear Regression Formula: 
+unit_price = 8.60 + 8.71(product_typeLuxury XL) - 5.98(product_typeRegular) - 7.28(product_typeShared) - 2.90(product_typeXL) + 3.29(cab_typeUber) - 0.148(day_timeMidday) - 0.180(day_timeMorning) + 3.29(day_timeNight) - 0.737(rain_levelLight) + 0.176(rain_levelMedium) + 1.01(rain_levelNo Rain) - 1.17(weekend)
+
+
+After analyzing the data above, the two biggest factors affecting the price are the company (Uber or Lyft) and which type of car (Shared, XL, etc.). Time of day, what day of the week it is, and weather, specifically rainfall, are factors that do not have a significant affect on the price. We created a linear regression model and formula stated above.
+
+
+Next we analyzed our model to find how accurate we can be in forecasting future Lyft and Uber rides. After seeing the summary of our model we can remove the midday time category as well as the categories of light and medium rain, all at the 95% confidence level. Besides those categories the model will hold at that level. Going forward we would like to take a log transformation of the response variable (unit price) to get a better understanding of our model and how well it works. 
+
+# 5. Digraph and Best Route
+
+Other then merely price quotes and product type, as well as the weather information, the data-set also provides us with the source and destination information, which attracted our attention. Since we have Erik, a Boston native, in our group, whose "sister" Erika might want to earn some extra money as a Uber or Lyft driver during his spare time. With price, distance, and direction, why don't we just challenge ourselves by mapping a best route for our group so that Erika can benefit from it.
+
+
+Before digging into this chapter, we need to clarify the terminology of the Graph Theory.
+
+- Graph Theory: In mathematics, graph theory is the study of graphs, which are mathematical structures used to model pairwise relations between objects.
+- Graph: In graph theory, a graph is made up of vertices (also called nodes or points) which are connected by edges (also called links or lines).
+- Digraph: Directed graph, where edges link two vertices asymmetrically
+
+Graph theory is widely used in map application, supply chain management, and other areas that involve optimization problems. As with this case, locating the most profitable route in a nework also requires knowledge from this field of interest.
+
+In this chapter, we will employ a classic algorithm in operations research, fit our route network into this algorithm, and find, from the perspective of a cab driver, the most lucrative route given a time budget. Essentially, the problem is transferable to **finding the longest path in a directed cyclic graph with the price as the "length" of each edge and time as a constraint of the problem, and allowing repetitive visits.**
+
+## 5.1 Scrape `duration_in_traffic` Value from Google Map Using API
+
+The original data-set only contains the distance information, while a time constraint is more intuitive when a driver wants to calculate his or her availability to drive. Therefore, we scraped with the `rvest` package on Aug 14th, 2019, 12:52:23 PM the **duration in traffic** from the Google Map with, assume the departure time is `2019-08-19 9:13:46 EST`. 
+
+(**Should you want to run the code on your own, the dep_time (departure time) should not be earlier than NOW. And please be careful not to overuse the API key since Google does not welcome that behavior and the key is of one of our group members.**)
+
+duration indicates the total duration of this leg, as a field with the following elements:
+- value indicates the duration in seconds.
+- text contains a human-readable representation of the duration.
+
+
+```{r obtaining the ETA from google map via web scraping}
+# the dep_time (departure time) should not be earlierr than NOW
+time_reader <- function(source, destination, 
+                        dep_time = as.numeric(as.POSIXct("2019-10-15 9:13:46 EST"))) {
+  # query function quering the time to drive from a place to another
+  # input: source: destination
+  # output: the ETA for a given source and destination
+  
+  # Shengwei's API key
+  google_map_key <- "AIzaSyAp4J-MzuDYBT40pghZCuXgQ8Sx1eNd_E0"
+  
+  # structured query
+  map_url = paste("https://maps.googleapis.com/maps/api/directions/xml?key=", google_map_key, 
+                  "&origin=", 
+                  source, 
+                  ",Boston,MA&destination=",
+                  destination,
+                  ",Boston,MA&departure_time=",
+                  dep_time,
+                  "&mode=driving",
+                  sep = "")
+  resp_xml <- read_xml(GET(map_url))
+  # the duration is stored in the 'value' branch, found by inspecting the original XML file
+  ETA <- xml_find_all(resp_xml, xpath = "//duration_in_traffic/value")
+  
+  # return the sum of time of each stage
+  return(xml_double(ETA))
+}
+
+cab_rides4 <- cab_rides
+
+# convert the space in destiantion and source columns to b ready for query
+cab_rides4$destination <- gsub("\\s+", "+", cab_rides4$destination)
+cab_rides4$source <- gsub("\\s+", "+", cab_rides4$source)
+
+routes <- cab_rides4 %>%
+  group_by(source, destination) %>%
+  dplyr::summarize(price = mean(price, na.rm = T), distance = median(distance_miles)) %>%
+  select(from = source, to = destination, price, distance) %>% 
+  ungroup() %>%
+  mutate(d_tag = cut(distance, breaks = 3),
+         ETA = unlist(map2(from, to, ~ time_reader(.x, .y))))
+
+
+routes$to <- gsub("\\+", " ", routes$to)
+routes$from <- gsub("\\+", " ", routes$from)
+```
+
+
+
+## 5.2 Mapping Profitable Districts of Boston from A Driver's Perspective
+
+
+```{r Maps about profitable districts of Boston}
+cab_rides_EW <- cab_rides
+
+# read external geographic coordinates data about Boston
+hood <- read_sf('C:/WFU/Courses/Intro_to_R/Group Project/Boston_Neighborhoods.shp')
+cab_rides_EW$normal_price <- ((cab_rides_EW$price/cab_rides_EW$distance_miles)/cab_rides_EW$surge_multiplier)
+cab_rides_EW$pickup <- as.character(cab_rides_EW$source)
+
+cab_rides_EW$Hood_Num <- 0
+
+cab_rides_EW$Hood_Num[cab_rides_EW$pickup %in% c("West End", "North Station")] <- 31
+cab_rides_EW$Hood_Num[cab_rides_EW$pickup %in% c("Northeastern University", "Boston University", "Fenway")] <- 34
+cab_rides_EW$Hood_Num[cab_rides_EW$pickup %in% c("Theatre District", "Financial District", "Haymarket Square")] <- 7 
+cab_rides_EW$Hood_Num[cab_rides_EW$pickup == "Back Bay"] <- 2
+cab_rides_EW$Hood_Num[cab_rides_EW$pickup == "Beacon Hill"] <- 30
+cab_rides_EW$Hood_Num[cab_rides_EW$pickup == "North End"] <- 14
+
+hood$Hood_Num <-as.numeric(hood$Neighborho)
+
+cab_rides_EW$mean_norm_price <- 0
+
+cab_rides_EW$mean_norm_price[cab_rides_EW$Hood_Num == 2] <- 9.49
+cab_rides_EW$mean_norm_price[cab_rides_EW$Hood_Num == 7] <- 11.8
+cab_rides_EW$mean_norm_price[cab_rides_EW$Hood_Num == 14] <- 10.2
+cab_rides_EW$mean_norm_price[cab_rides_EW$Hood_Num == 30] <- 7.87
+cab_rides_EW$mean_norm_price[cab_rides_EW$Hood_Num == 31] <- 9.48
+cab_rides_EW$mean_norm_price[cab_rides_EW$Hood_Num == 34] <- 6.86
+
+cab_rides_EW %>%
+  group_by(Hood_Num)%>%
+  dplyr::summarize(mean_norm_price = mean(normal_price, na.rm = TRUE))
+  
+cab_rides_EW1 <- cab_rides_EW %>%
+  group_by(Hood_Num) %>%
+  dplyr::summarize(mean_norm_price = first(mean_norm_price))
+  
+price_hood <- left_join(hood, cab_rides_EW1, by = "Hood_Num")
+price_hood1 <- price_hood %>%
+  na.omit(price_hood)
+
+ggplot(data = price_hood1$geometry, aes(fill = price_hood1$mean_norm_price)) +
+  geom_sf(alpha = 0.2) +
+  ggtitle("Boston Neighborhoods") +
+  labs(fill = "Mean Normalized Price") +
+  coord_sf() +
+  scale_fill_gradient(low = "#7FFF00", high = "#FF4500")
+```
+
+
+
+## 5.3 Digraph for our destination and source
+
+There are 72 possible routes the data creator queried for in the data-set for each company: Uber and Lyft, which is also the number of edges of our digraph. 
+
+```{r check the possible routes in the dataset}
+possible_routes <- cab_rides %>%
+  group_by(source, destination, cab_type) %>%
+  dplyr::summarize()
+
+glimpse(possible_routes)
+```
+
+
+Calculating the number of vertices, we found that we had 12 vertices but only 72 edges, so the graph was not a complete graph in terms of the graph theory, in which every pair of distinct vertices is connected by a unique edge. It will be more intuitive by inspecting the network graph, so we decided to plot a network graph to gain the big picture of our problem.
+
+```{r plot the digraph based on price}
+# Vertices
+places <- cab_rides %>%
+  group_by(destination) %>%
+  dplyr::summarize()
+
+
+# create the graph
+g <- graph_from_data_frame(routes, directed = T, vertices = places)
+print(g, e = TRUE, v = TRUE)
+
+
+width_scale <- ((E(g)$price)^4) / (2^15)
+arrow_scale <- ((E(g)$price)^4) / (4^10) 
+
+# create a function for digraph plotting
+plot_digraph <- function(g, width_scale, arrow_scale) {
+
+  #tkplot(g)
+  # close medium far
+  colrs <- c("gray50", "tomato", "gold")
+  # preparation for plot
+  E(g)$color <- colrs[factor(E(g)$d_tag)]
+  E(g)$width <-  width_scale# scale the difference
+  E(g)$arrow.size <- arrow_scale
+
+
+  # set up the shifting position of the label
+  ##############################################################
+  # https://stackoverflow.com/questions/23209802/placing-vertex-label-outside-a-circular-layout-in-igraph
+  # Add reference
+  radian.rescale <- function(x, start=0, direction=1) {
+    c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+    c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+  }
+  lab.locs <- radian.rescale(x = 1:12, direction = -1, start = 0)
+  ## Obviously labeling in this way this only makes sense for graphs
+  ## laid out as a circle to begin with
+  ##############################################################
+
+  # Plot the di-graph
+  plot(g, edge.curved = 0,
+     vertex.size = 20, vertex.label.degree = lab.locs,
+     vertex.color = "orange", vertex.frame.color = "#555555",
+     vertex.label.color = "black",
+     vertex.label.cex = 1.5, vertex.label.dist = 2,
+     layout = layout_in_circle(g)) 
+
+  m <- as_adjacency_matrix(g, attr = "price", sparse = F)
+  colnames(m) <- V(g)$name
+  rownames(m) <- V(g)$name
+  palf <- colorRampPalette(c("#FAFAD2", "dark orange")) 
+  heatmap(m, Rowv = NA, Colv = NA, col = palf(10),
+          scale = "none", margins = c(10, 10))
+}
+
+# call the function
+plot_digraph(g, width_scale, arrow_scale)
+
+```
+
+Looking at the network graph, we can tell that a vertex only connects to part of others. Though it does has a way to go anywhere else from a given source in reality, the issue is out of the scope of our capacity and we will discuss the problem only within the scope of the data at hand. It is beneficial for us to learn from this modeling process and we will be able to apply the model to another similar ones once we have obtained the prototype.
+
+Coming back to the network graph, the width of edge represents the price of that directed route, the wider the edge, the higher the price for that trip on average. In addition, the color of edge, as a categorical variable, represents the distance of that route, with gold standing for "far", tomato for "medium", and gray for "close".
+
+If the network seems too complex to you, we also provide an alternative -- a heat map matrix with the starting points as the x label and the destinations as the y label. The deeper the color, the higher the price for that trip. 
+
+Similarly, we can plot the network graph with different attributes. For example, we transformed the meaning of width to the unit price per mile in the chart below.
+
+```{r price per mile}
+
+# Edges
+routes2 <- cab_rides %>%
+  group_by(source, destination) %>%
+  dplyr::summarize(price = mean(price, na.rm = T), distance = median(distance_miles)) %>%
+  select(from = source, to = destination, price, distance) %>% 
+  ungroup() %>%
+  mutate(d_tag = cut(distance, breaks = 3),
+         unit_price = round(price/distance, 4)) %>%
+  arrange(desc(unit_price))
+    
+
+# create the graph
+g2 <- graph_from_data_frame(routes2, directed = T, vertices = places)
+print(g2, e = TRUE, v = TRUE)
+
+
+width_scale2 <- (E(g2)$unit_price-4)^0.7
+arrow_scale2 <- (E(g2)$unit_price - 4)/40
+  
+# call the plot function  
+plot_digraph(g2, width_scale2, arrow_scale)
+```
+
+
+You can find that those wide edges in the previous graph now become unprofitable in terms of the unit price per mile, and the short routes dominate.
+
+This discovery is vitally important because it gives us a hint of how the most profitable may look like when we try to locate the best in terms of profit or revenue.
+
+## 5.4 Best Route with A Budget -- Time
+
+After consulting prof. Camm, our respectful dean specializing in Management Science and Operations Research, we decided to approach this problem using Linear Programming, "a method to achieve the best outcome (such as maximum profit or lowest cost) in a mathematical model whose requirements are represented by linear relationships".
+
+```{r, warning = F}
+# I. data wrangling for linear programming computation
+source_sink <- tribble(
+  ~destination, 
+  "source",
+  "sink"
+)
+
+places2 <- rbind(places, source_sink)
+
+
+# generate the permutation of from and to
+routes6 <- rename(as_tibble(expand.grid(places2$destination, places2$destination)), from = Var1, to = Var2)
+
+lp_routes <- routes6 %>%
+  left_join(routes, by = c("from", "to")) %>%
+  select(-d_tag)
+
+# dealing to = sink
+lp_routes$price[lp_routes$to == "sink"] <- 0
+lp_routes$distance[lp_routes$to == "sink"] <- 0
+lp_routes$ETA[lp_routes$to == "sink"] <- 0
+# dealing from = source
+lp_routes$price[lp_routes$from == "source"] <- 0
+lp_routes$distance[lp_routes$from == "source"] <- 0
+lp_routes$ETA[lp_routes$from == "source"] <- 0
+
+# dealing with from = source & to = sink, or from = sink & to = source
+lp_routes$price[(lp_routes$from == "source" & lp_routes$to== "sink") | (lp_routes$from == lp_routes$to)] <- -Inf
+lp_routes$distance[(lp_routes$from == "source" & lp_routes$to== "sink") | (lp_routes$from == lp_routes$to)] <- Inf
+lp_routes$ETA[(lp_routes$from == "source" & lp_routes$to== "sink") | (lp_routes$from == lp_routes$to)] <- Inf
+
+
+# 
+lp_routes$price[is.na(lp_routes$price)] <- -Inf
+lp_routes$distance[is.na(lp_routes$distance)] <- Inf
+lp_routes$ETA[is.na(lp_routes$ETA)] <- Inf
+
+# arrange so it's easier to view
+lp_routes$from <- factor(lp_routes$from, levels = c("source", places$destination, "sink"))
+lp_routes$to <- factor(lp_routes$to, levels = c("source", places$destination, "sink"))
+
+lp_routes <- arrange(lp_routes, from, to)
+
+c_places <- unique(lp_routes$from)
+
+# exclude no pass route
+lp_routes2 <- lp_routes %>%
+  filter(price >= 0)
+lp_routes_X <- lp_routes %>%
+  filter(price < 0)
+
+
+
+# route matrix/gives a clue of what we are doing
+
+# price
+# source: row 11 column 11
+# sink: row 10 column 10
+routes_price <- lp_routes2 %>%
+  select(from, to, price) %>%
+  spread(key = to, value = price)
+
+routes_price[is.na(routes_price)] <- -Inf
+
+price_matrix <- as.matrix(routes_price[,2:14])
+price_matrix
+
+# time
+routes_time <- lp_routes2 %>%
+  select(from, to, ETA) %>%
+  spread(key = to, value = ETA)
+
+routes_time[is.na(routes_time)] <- Inf
+
+time_matrix <- as.matrix(routes_time[,2:14])
+time_matrix
+```
+
+The above two matrices represent the objective function and the time constraint function respectively in terms of linear algebra. We will then put them into the `lpSolver`, a package for Linear Programming in R, to compute the result after some data wrangling.
+
+As we are good to go, let's propose a scenario for Erika. Say occasionally Erika would have an extra hour available to drive for Uber or Lyft after a busy day at work or before she went to Boston University for class, how to drive to maximize her revenue within that time budget?
+
+
+```{r Linear Programming, warning = F}
+# establish model
+
+## 1. write the objective function 
+obj.fun <- lp_routes2$price
+
+## 2. build constraint 
+
+### time constraint
+constr.time <- lp_routes2$ETA
+
+### flow constraint
+
+lp_routes3 <- lp_routes2
+
+for (name in c_places) {
+  lp_routes3[[name]][lp_routes3$from == name] <- 1
+  lp_routes3[[name]][lp_routes3$to == name] <- -1
+}
+
+constr.flow <- t(as.matrix(lp_routes3[,6:19]))
+
+### distance constr
+constr.dist <- lp_routes2$distance
+
+### combine constr
+constr <- rbind(constr.time, constr.flow)
+
+
+
+# 3. Solving model
+
+## Time budgeted
+constr[is.na(constr)] <- 0
+constr.dir <- c("<=", "=", "=", "=", "=", "=", "=", "=", "=", "=", "=", "=", "=", "=", "=")
+
+# set time budget here
+time_budget <- 3600
+
+rhs <- c(time_budget, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1)
+
+## run the linear programming function to get the solution
+prod.sol <- lp("max", obj.fun, constr, constr.dir, rhs, compute.sens = TRUE)
+
+# arguments:
+# , binary.vec = 1:96, all.int = T, 
+
+routes3 <- lp_routes2 %>%
+  mutate(x_ij = prod.sol$solution) %>%
+  select(from, to, x_ij) %>%
+  right_join(routes, by = c("from", "to")) %>%
+  filter(x_ij > 0)
+
+routes3$x_ij <- as.integer(routes3$x_ij)
+
+# print out result
+writeLines("Vertices index: ")
+which(prod.sol$solution != 0)
+writeLines("Number of Times drove through: ") 
+as.integer(prod.sol$solution[which(prod.sol$solution != 0)])
+
+
+# total utility
+writeLines(paste("Total Revenue: $", round(sum(routes3$x_ij * routes3$price), 2)))
+# total cost
+writeLines(paste("Total Time consumed: ", round(sum(routes3$x_ij * routes3$ETA)/60, 2), " minutes"))
+```
+
+Wow we got it! Given the time constraint of 3600 seconds, it is best for Erika to start from the Haymarket Square, driving back and forth between the source and North Station, and head to Boston University after the 4th round trip.
+
+- **Best Route in an hour: Haymarket Square -> North Station -> Haymarket Square -> North Station -> Haymarket Square -> North Station -> Haymarket Square -> North Station -> Boston University**
+
+The result is beyond our expectation but does make sense. Erika can earn \$2.62 per minute driving from Haymarket Square to North Station and \$1.93 in the opposite direction. What an expensive trip! So it is justifiable to keep taking advantage of the most profitable route and exit when the time limit comes.
+
+Visualization of the best route provided below.
+
+
+
+
+
+## 5.5 Visualize the best route
+
+```{r visualization of best route}
+
+
+g3 <- graph_from_data_frame(routes3, directed = T, vertices = places)
+
+
+width_scale3 <- E(g3)$x_ij*4
+arrow_scale3 <- E(g3)$x_ij / 4
+
+
+plot_digraph(g3, width_scale3, arrow_scale3)
+```
+
+
+
+# 6. Conclusion
+
+Our goal was to predict when prices will surge by determining what factors affect the price in order to either take advantage as a passenger or as a driver.
+
+According to the observation, the influence is not as significant as we anticipated. To illustrate, if the distance is controlled at 5 miles, the price points are spread evenly with no significant indicator shows the strong relationship between the two. The scatter points are distributed in a fairly normal way. So we observed that the rainy day would not necessarily ties with the price increase.
+
+For the revenue maximizing route, a Boston University student driver would like to follow this path below if he or she has only an hour for the part-time job everyday.
+
+Haymarket Square -> North Station -> Haymarket Square -> North Station -> Haymarket Square -> North Station -> Haymarket Square -> North Station -> Boston University
+
+# 7. What's Next
+
+For our linear regression model, in order to continue our study, more observations need to be collected, specifically real rides. The data we were using is theoretical rides (what the ride should cost if the person called it at that time). 
+
+For our route searching strategy, first, different strategy should apply to different scenarios with heterogeneous starting points, destinations, time budget or gasoline budget, and cab type, while we have shown only one route for revenue maximizing given that the rider starts from Haymarket Square and need to arrive in Boston University one hour later. Nonetheless, we are satisfied proposing a prototype solution to this kind of problem in the project and successors may scale the solution into various situations by adjusting the parameters.
+
+Besides, although we have computed the best route based on the data-set, further research on the matching mechanism of Uber and Lyft revealed to us that there is actually no way for a driver to learn about the destination before he or she pick up the rider, the same as that of a traditional taxi. It is useful in preventing the driver from rejecting a ride request while also renders our current model unfeasible in the real world.
+
+However, we can still fix this issue by transferring our focus to a probabilistic/non-deterministic model from the deterministic one we have now. More specifically, we need to first learn about the probability distribution about the destination of a ride order as well as the distribution of the waiting time between fares in Boston, then run a simulation to repeat our optimization algorithm. Finally we will be able to come up with not a definite route but an instruction for driver on how to make decision, for example, on whether to pick up a rider from the Financial District given that the driver has waited for a fare for 5 minutes. The picture is too big for us to realize within the time limit we have for the project and those who would like to continue the research may follow this clue.
+
+
+## Bibliography
+
+[1] Retrieved data from Kaggle Dataset  Uber & Lyft Cab prices, URL:  
+  https://www.kaggle.com/ravi72munde/uber-lyft-cab-prices
+
+[2] ggmap: D. Kahle and H. Wickham. ggmap: Spatial Visualization with ggplot2. The R Journal, 5(1), 144-161. URL:
+  http://journal.r-project.org/archive/2013-1/kahle-wickham.pdf
+
+[3] Retrieved shape file from Boston Open Portal: 
+  https://data.boston.gov/dataset/boston-neighborhoods
+
